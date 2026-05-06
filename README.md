@@ -71,6 +71,14 @@ python3 watcher.py --config /path/to/config.yaml
 5. First run populates state without notifications (avoids startup storm).
 6. Exponential backoff on errors (30s → 60s → ... capped at 15min).
 
+### Online-only filtering
+
+When `online_only: true` (the default), the watcher excludes all in-person and Mixed Mode sections. Only sections with `instructionalMethod == "X"` (Banner's code for fully online courses) are tracked. Mixed Mode (`M`) requires campus attendance and is **not** considered online. If no online sections currently exist for a watch target, the watcher logs a warning and continues running — it will notify you if an online section is added later.
+
+### New-section detection
+
+When `notify_new_sections: true` (the default), the watcher sends a Discord notification whenever a CRN appears in search results that wasn't in the previous state file. This catches mid-term section additions. The notification uses a blue embed titled "New section added." This feature respects `online_only` — if enabled, only new online sections trigger notifications. Like seat notifications, new-section notifications are suppressed on the very first run to avoid a startup storm.
+
 ## Always-on deployment (systemd)
 
 ```ini
