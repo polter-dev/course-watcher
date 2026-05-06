@@ -22,3 +22,6 @@ env/
 .vscode/
 .idea/
 *.swp
+
+config.yaml
+.claude/
