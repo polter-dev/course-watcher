@@ -31,6 +31,8 @@ def load_config(path):
     cfg.setdefault("poll_jitter", 15)
     cfg.setdefault("notify_waitlist", False)
     cfg.setdefault("state_file", "seats.json")
+    cfg.setdefault("online_only", True)
+    cfg.setdefault("notify_new_sections", True)
     if "term" not in cfg:
         log("FATAL", "config missing required 'term' field")
         sys.exit(1)
@@ -273,10 +275,57 @@ def matches_watch(section, course_cfg):
     return subj_match and num_match
 
 
+def is_online_section(section):
+    """A section is online if instructionalMethod == 'X' (Online Course).
+    Mixed Mode ('M') and Onsite ('N') are NOT online.
+    See banner_api_notes.md 'Identifying Online Sections' for probe data."""
+    method = section.get("instructionalMethod")
+    if method is None:
+        log("WARN", f"CRN {section.get('courseReferenceNumber', '?')}: "
+                     "instructionalMethod is missing — treating as non-online")
+    return method == "X"
+
+
+def build_new_section_embed(section):
+    """Build a Discord embed for a newly added section."""
+    crn = section["courseReferenceNumber"]
+    subject = section["subject"]
+    course_num = section["courseNumber"]
+    title_text = section.get("courseTitle", "")
+    instructor = get_instructor(section)
+    meeting = format_meeting_times(section)
+    seats_avail = section["seatsAvailable"]
+    seats_total = section["maximumEnrollment"]
+    wait_avail = section.get("waitAvailable", 0)
+    wait_cap = section.get("waitCapacity", 0)
+
+    fields = [
+        {"name": "CRN", "value": crn, "inline": True},
+        {"name": "Title", "value": title_text or "N/A", "inline": True},
+        {"name": "Instructor", "value": instructor, "inline": True},
+        {"name": "Seats", "value": f"**{seats_avail}** / {seats_total} available", "inline": True},
+    ]
+    if wait_cap > 0:
+        fields.append({"name": "Waitlist", "value": f"**{wait_avail}** / {wait_cap} available", "inline": True})
+    fields.append({"name": "Schedule", "value": meeting, "inline": False})
+    fields.append({
+        "name": "Banner",
+        "value": f"[Search page]({BANNER_SEARCH_URL})",
+        "inline": False,
+    })
+
+    return {
+        "title": f"\U0001f195 New section added: {subject} {course_num}",
+        "color": 0x3498DB,  # blue
+        "fields": fields,
+        "footer": {"text": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+    }
+
+
 def poll_cycle(cfg, state, webhook_url, dry_run=False):
     """Run one poll cycle. Returns updated state dict and whether any notifications were sent."""
     term = cfg["term"]
-    first_run = state is None
+    first_run = state is None or not state
     if first_run:
         state = {}
 
@@ -306,10 +355,18 @@ def poll_cycle(cfg, state, webhook_url, dry_run=False):
         all_sections.extend(sections)
 
     # Filter to only sections matching our watch list
+    online_only = cfg.get("online_only", True)
+    notify_new = cfg.get("notify_new_sections", True)
     watched = []
+    all_matched_crns = set()  # CRNs matching watch list before online filter
     for section in all_sections:
         for course in cfg["courses"]:
             if matches_watch(section, course):
+                all_matched_crns.add(section["courseReferenceNumber"])
+                if online_only and not is_online_section(section):
+                    log("INFO", f"Excluding {section['courseReferenceNumber']} ({get_instructor(section)}, "
+                                f"{section.get('campusDescription', 'N/A')}): not online")
+                    break
                 watched.append(section)
                 break
 
@@ -318,7 +375,7 @@ def poll_cycle(cfg, state, webhook_url, dry_run=False):
             log("WARN", "No sections matched watch list this cycle — skipping state update "
                         "(possible stale session or Banner outage)")
             return state, False
-        log("WARN", "No sections matched watch list this cycle")
+        log("WARN", "No matching sections this cycle (online_only={})".format(online_only))
 
     notified = False
     new_state = {}
@@ -333,6 +390,7 @@ def poll_cycle(cfg, state, webhook_url, dry_run=False):
         wait_cap = section.get("waitCapacity", 0)
         label = f"{subj} {cnum} CRN {crn}"
 
+        is_new = crn not in state
         old = state.get(crn, {})
         old_seats = old.get("seats", 0)
         old_wait = old.get("wait", 0)
@@ -342,6 +400,16 @@ def poll_cycle(cfg, state, webhook_url, dry_run=False):
         if first_run:
             log("INFO", f"{label}: seats {seats}/{seats_total}, wait {wait}/{wait_cap} (initial load, no notification)")
             continue
+
+        # New-section detection: CRN not in previous state
+        if is_new and notify_new:
+            log("INFO", f"{label}: NEW SECTION DETECTED — seats {seats}/{seats_total} (NOTIFY)")
+            embed = build_new_section_embed(section)
+            if webhook_url:
+                if not send_discord(webhook_url, embed, dry_run=dry_run):
+                    log("ERROR", f"{label}: failed to deliver new-section notification to Discord")
+            notified = True
+            continue  # Don't also fire seat notification for brand-new sections
 
         # Seat notification: <=0 → >0
         if old_seats <= 0 and seats > 0:
@@ -367,9 +435,11 @@ def poll_cycle(cfg, state, webhook_url, dry_run=False):
                 log("INFO", f"{label}: waitlist {old_wait} → {wait}")
 
     # Detect sections that disappeared (cancelled or removed)
+    # Only carry forward CRNs that were in the pre-filter matched set.
+    # Don't carry forward CRNs excluded by online_only — they'd persist forever.
     if not first_run:
         for crn in state:
-            if crn not in new_state:
+            if crn not in new_state and crn in all_matched_crns:
                 log("WARN", f"CRN {crn} disappeared from results — section may have been cancelled. "
                             "Carrying forward last state to avoid false trigger on reappearance.")
                 new_state[crn] = state[crn]
@@ -388,6 +458,8 @@ def startup_checks(cfg):
     # Init session and check each watch target returns sections
     init_banner_session(session, cfg["term"])
 
+    online_only = cfg.get("online_only", True)
+
     for course in cfg["courses"]:
         label = course.get("crn") or f"{course.get('subject', '?')} {course.get('courseNumber', '?')}"
         sections = search_sections(
@@ -401,11 +473,30 @@ def startup_checks(cfg):
             log("FATAL", f"Watch target '{label}' returned 0 matching sections for term {cfg['term']}. "
                          f"Check subject/courseNumber/crn in config. Search returned {len(sections)} total sections.")
             sys.exit(1)
-        log("INFO", f"Watch target '{label}': found {len(matched)} section(s)")
-        for s in matched:
-            log("INFO", f"  CRN {s['courseReferenceNumber']}: {s['courseTitle']} — "
-                        f"{s['seatsAvailable']}/{s['maximumEnrollment']} seats, "
-                        f"instructor: {get_instructor(s)}")
+
+        # Apply online filter for reporting
+        if online_only:
+            online_matched = [s for s in matched if is_online_section(s)]
+            excluded = [s for s in matched if not is_online_section(s)]
+            for s in excluded:
+                log("INFO", f"Excluding CRN {s['courseReferenceNumber']} "
+                            f"({get_instructor(s)}, {s.get('campusDescription', 'N/A')}): not online")
+            if not online_matched:
+                log("WARN", f"No online sections of {label} currently exist for term {cfg['term']}. "
+                            f"Watcher will continue running and notify you if one is added.")
+            else:
+                log("INFO", f"Watch target '{label}': {len(online_matched)} online section(s) "
+                            f"({len(excluded)} non-online excluded)")
+                for s in online_matched:
+                    log("INFO", f"  CRN {s['courseReferenceNumber']}: {s['courseTitle']} — "
+                                f"{s['seatsAvailable']}/{s['maximumEnrollment']} seats, "
+                                f"instructor: {get_instructor(s)}")
+        else:
+            log("INFO", f"Watch target '{label}': found {len(matched)} section(s)")
+            for s in matched:
+                log("INFO", f"  CRN {s['courseReferenceNumber']}: {s['courseTitle']} — "
+                            f"{s['seatsAvailable']}/{s['maximumEnrollment']} seats, "
+                            f"instructor: {get_instructor(s)}")
 
     log("INFO", "Startup checks passed")
 
@@ -444,7 +535,8 @@ def main():
         try:
             new_state, _ = poll_cycle(cfg, state, webhook_url, dry_run=args.dry_run)
             state = new_state
-            save_state(state_file, state)
+            if state:
+                save_state(state_file, state)
             consecutive_failures = 0
         except requests.RequestException as e:
             consecutive_failures += 1

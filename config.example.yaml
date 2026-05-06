@@ -25,6 +25,19 @@ poll_interval: 180
 # Avoids a fixed polling pattern.
 poll_jitter: 15
 
+# Only track online sections (instructionalMethod == "X").
+# When true, in-person and Mixed Mode sections are excluded from
+# polling, state tracking, and notifications. If no online sections
+# exist for a watch target, the watcher continues running and will
+# notify you when one is added. Default true.
+online_only: true
+
+# Send a notification when a brand-new section (CRN not previously seen)
+# appears in search results. Respects online_only — if enabled, only new
+# online sections trigger notifications. Does not fire on first run.
+# Default true.
+notify_new_sections: true
+
 # Send notifications when waitlist spots open (0 → >0).
 # Default off — most Valencia sections have waitCapacity=0 anyway.
 notify_waitlist: false

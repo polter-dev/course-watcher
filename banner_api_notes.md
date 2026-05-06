@@ -299,6 +299,73 @@ Below is the complete JSON shape for one section, with types annotated.
 
 ---
 
+## Identifying Online Sections
+
+> Probed 2026-05-06 against ENC 1101 (mix of online and in-person) and PHY 2049C (all in-person) for term 202630.
+
+### `instructionalMethod` values observed
+
+| Code | Description | Online? |
+|------|-------------|---------|
+| `X` | Online Course | **Yes** |
+| `M` | Mixed Mode | No — requires campus attendance |
+| `N` | Onsite Course/Face to Face | No |
+
+### Heuristic
+
+A section is online if and only if `instructionalMethod == "X"`. This is the single reliable indicator.
+
+- **Do NOT use `campusDescription`** — online sections still show a home campus (e.g., "West Campus", "East Campus"). It is the administrative campus, not the delivery mode.
+- **`building == "ONLINE"` and `meetingType == "WEB"`** are also reliable for online sections, but `instructionalMethod` alone is sufficient and simpler.
+- **Mixed Mode (`M`) is NOT online** — these sections have a physical classroom component.
+
+### Example: Online section (ENC 1101 CRN 32934)
+
+```json
+{
+  "instructionalMethod": "X",
+  "instructionalMethodDescription": "Online Course",
+  "campusDescription": "West Campus",
+  "meetingsFaculty": [{
+    "meetingTime": {
+      "building": "ONLINE",
+      "meetingType": "WEB",
+      "beginTime": null,
+      "endTime": null
+    }
+  }]
+}
+```
+
+### Example: In-person section (PHY 2049C CRN 31471)
+
+```json
+{
+  "instructionalMethod": "N",
+  "instructionalMethodDescription": "Onsite Course/Face to Face",
+  "campusDescription": "East Campus",
+  "meetingsFaculty": [
+    { "meetingTime": { "building": "EC-01B", "meetingType": "LAB" } },
+    { "meetingTime": { "building": "EC-01B", "meetingType": "CLAS" } }
+  ]
+}
+```
+
+### Example: Mixed Mode section (PHY 2049C CRN 30199)
+
+```json
+{
+  "instructionalMethod": "M",
+  "instructionalMethodDescription": "Mixed Mode",
+  "campusDescription": "Osceola Campus",
+  "meetingsFaculty": [{
+    "meetingTime": { "building": "OC-004", "meetingType": "LAB" }
+  }]
+}
+```
+
+---
+
 ## Minimal Working Example (curl)
 
 ```bash
