@@ -84,13 +84,20 @@ Wants=network-online.target
 Type=simple
 User=youruser
 WorkingDirectory=/path/to/course_notif
-Environment=DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+EnvironmentFile=/path/to/course_notif/.env
 ExecStart=/path/to/course_notif/venv/bin/python3 watcher.py
 Restart=on-failure
 RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
+```
+
+Create the env file with restricted permissions:
+
+```bash
+echo 'DISCORD_WEBHOOK=https://discord.com/api/webhooks/...' > /path/to/course_notif/.env
+chmod 600 /path/to/course_notif/.env
 ```
 
 ```bash
