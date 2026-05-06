@@ -297,6 +297,15 @@ Below is the complete JSON shape for one section, with types annotated.
 
 11. **The `txt_term` param on searchResults appears redundant** — the session already has the term set from the POST. However, the web UI sends it, so include it for safety.
 
+12. **Hidden full sections — `chk_open_only` is an inverter, not an override.** Banner's default search returns only sections with open seats. Setting `chk_open_only=false` does NOT return all sections — it **inverts** the filter, returning only currently-full sections. To get ALL sections, you must make two requests and merge by CRN:
+    - Request 1: default params (no `chk_open_only`) → sections with open seats
+    - Request 2: `chk_open_only=false` → sections with 0 available seats
+    - Union by `courseReferenceNumber`, deduplicate
+
+    **Additional quirk:** Banner caches the `chk_open_only` setting per session. If the first search in a session uses the default (open only), all subsequent searches in that session ignore `chk_open_only=false` and keep returning open-only results. The two requests **must use separate sessions** (separate `JSESSIONID` cookies).
+
+    Verified empirically against PHY 2049C Summer 2026: default returned 3 sections (all open), `chk_open_only=false` in a fresh session returned 5 sections (all full), total unique = 8.
+
 ---
 
 ## Identifying Online Sections

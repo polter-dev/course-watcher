@@ -113,22 +113,8 @@ def validate_term(session, term):
     sys.exit(1)
 
 
-def search_sections(session, term, subject, course_number=None, crn=None):
-    """Search Banner for sections. Returns list of section dicts or raises."""
-    params = {
-        "txt_term": term,
-        "pageOffset": 0,
-        "pageMaxSize": 200,
-        "sortColumn": "subjectDescription",
-        "sortDirection": "asc",
-    }
-    if crn:
-        params["txt_crn"] = crn
-    else:
-        params["txt_subject"] = subject
-        if course_number:
-            params["txt_courseNumber"] = course_number
-
+def _fetch_sections(session, params):
+    """Single Banner search request. Returns list of section dicts or raises."""
     resp = session.get(f"{BASE_URL}/searchResults/searchResults", params=params)
     resp.raise_for_status()
     data = resp.json()
@@ -146,6 +132,68 @@ def search_sections(session, term, subject, course_number=None, crn=None):
                      f"Consider narrowing your search (use courseNumber or CRN).")
 
     return data["data"]
+
+
+def search_sections(session, term, subject, course_number=None, crn=None):
+    """Search Banner for sections, merging open and full results.
+
+    Banner quirks:
+    - Default search returns only sections with open seats.
+    - chk_open_only=false INVERTS this, returning only full sections.
+    - Banner caches the chk_open_only setting per session, so the second
+      request in the same session ignores the parameter change.
+    To get ALL sections we make the open-seats request on the provided
+    session, then create a fresh session for the full-sections request.
+    """
+    base_params = {
+        "txt_term": term,
+        "pageOffset": 0,
+        "pageMaxSize": 200,
+        "sortColumn": "subjectDescription",
+        "sortDirection": "asc",
+    }
+    if crn:
+        base_params["txt_crn"] = crn
+    else:
+        base_params["txt_subject"] = subject
+        if course_number:
+            base_params["txt_courseNumber"] = course_number
+
+    open_sections = []
+    full_sections = []
+    open_ok = False
+    full_ok = False
+
+    # Request 1: open seats (default), using existing session
+    try:
+        open_sections = _fetch_sections(session, base_params)
+        open_ok = True
+    except (requests.RequestException, RuntimeError) as e:
+        log("WARN", f"Failed to fetch open sections: {e}")
+
+    # Request 2: full sections only — needs its own session because
+    # Banner caches chk_open_only per session
+    try:
+        full_session = make_session()
+        init_banner_session(full_session, term)
+        full_params = {**base_params, "chk_open_only": "false"}
+        full_sections = _fetch_sections(full_session, full_params)
+        full_ok = True
+    except (requests.RequestException, RuntimeError) as e:
+        log("WARN", f"Failed to fetch full sections: {e}")
+
+    if not open_ok and not full_ok:
+        raise RuntimeError("Both open and full section searches failed")
+
+    # Merge, deduping by CRN (prefer open-seats data since it has current counts)
+    seen = {}
+    for section in open_sections:
+        seen[section["courseReferenceNumber"]] = section
+    for section in full_sections:
+        if section["courseReferenceNumber"] not in seen:
+            seen[section["courseReferenceNumber"]] = section
+
+    return list(seen.values())
 
 
 def format_meeting_times(section):
