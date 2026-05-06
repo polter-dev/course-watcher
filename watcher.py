@@ -2,6 +2,7 @@
 """Valencia College Banner course availability watcher with Discord notifications."""
 
 import argparse
+import fcntl
 import json
 import os
 import random
@@ -40,11 +41,19 @@ def load_config(path):
 
 
 def load_state(path):
-    """Load persisted seat state. Returns None if file doesn't exist (first run)."""
-    if not os.path.exists(path):
+    """Load persisted seat state. Returns None if file doesn't exist or is corrupt."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            log("WARN", f"State file {path} has unexpected type {type(data).__name__}, treating as first run")
+            return None
+        return data
+    except FileNotFoundError:
         return None
-    with open(path) as f:
-        return json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        log("WARN", f"State file {path} is corrupt ({e}), treating as first run")
+        return None
 
 
 def save_state(path, state):
@@ -56,9 +65,18 @@ def save_state(path, state):
 
 
 def make_session():
-    """Create a requests.Session with our User-Agent."""
+    """Create a requests.Session with our User-Agent and default timeout."""
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})
+
+    # Patch send to enforce default timeout (10s connect, 30s read)
+    original_send = s.send
+
+    def send_with_timeout(*args, **kwargs):
+        kwargs.setdefault("timeout", (10, 30))
+        return original_send(*args, **kwargs)
+
+    s.send = send_with_timeout
     return s
 
 
@@ -118,6 +136,12 @@ def search_sections(session, term, subject, course_number=None, crn=None):
             f"Banner returned success={data.get('success')}, data={data.get('data')} "
             f"(totalCount={data.get('totalCount')}). Likely stale session or bad query."
         )
+
+    total = data.get("totalCount", 0)
+    fetched = len(data["data"])
+    if total > fetched:
+        log("WARN", f"Banner returned {fetched}/{total} sections — results truncated. "
+                     f"Consider narrowing your search (use courseNumber or CRN).")
 
     return data["data"]
 
@@ -211,20 +235,31 @@ def build_discord_embed(section, change_type, old_count, new_count):
 
 
 def send_discord(webhook_url, embed, dry_run=False):
-    """Send a Discord webhook with an embed. Returns True on success."""
+    """Send a Discord webhook with an embed. Retries once on 429. Returns True on success."""
     payload = {"embeds": [embed]}
     if dry_run:
         log("DRY-RUN", f"Would send: {embed['title']}")
         return True
-    try:
-        resp = requests.post(webhook_url, json=payload, headers={"User-Agent": USER_AGENT}, timeout=10)
-        if resp.status_code == 204:
-            return True
-        log("WARN", f"Discord webhook returned {resp.status_code}: {resp.text[:200]}")
-        return False
-    except requests.RequestException as e:
-        log("ERROR", f"Discord webhook failed: {e}")
-        return False
+    for attempt in range(2):
+        try:
+            resp = requests.post(webhook_url, json=payload, headers={"User-Agent": USER_AGENT}, timeout=10)
+            if resp.status_code == 204:
+                return True
+            if resp.status_code == 429 and attempt == 0:
+                retry_after = 5
+                try:
+                    retry_after = resp.json().get("retry_after", 5)
+                except (ValueError, KeyError):
+                    pass
+                log("WARN", f"Discord rate limited, retrying after {retry_after}s")
+                time.sleep(retry_after)
+                continue
+            log("WARN", f"Discord webhook returned {resp.status_code}: {resp.text[:200]}")
+            return False
+        except requests.RequestException as e:
+            log("ERROR", f"Discord webhook failed: {e}")
+            return False
+    return False
 
 
 def matches_watch(section, course_cfg):
@@ -279,6 +314,10 @@ def poll_cycle(cfg, state, webhook_url, dry_run=False):
                 break
 
     if not watched:
+        if not first_run and state:
+            log("WARN", "No sections matched watch list this cycle — skipping state update "
+                        "(possible stale session or Banner outage)")
+            return state, False
         log("WARN", "No sections matched watch list this cycle")
 
     notified = False
@@ -304,26 +343,36 @@ def poll_cycle(cfg, state, webhook_url, dry_run=False):
             log("INFO", f"{label}: seats {seats}/{seats_total}, wait {wait}/{wait_cap} (initial load, no notification)")
             continue
 
-        # Seat notification: 0 → >0
-        if old_seats == 0 and seats > 0:
+        # Seat notification: <=0 → >0
+        if old_seats <= 0 and seats > 0:
             log("INFO", f"{label}: seats {old_seats} → {seats} (NOTIFY)")
             embed = build_discord_embed(section, "seats", old_seats, seats)
             if webhook_url:
-                send_discord(webhook_url, embed, dry_run=dry_run)
+                if not send_discord(webhook_url, embed, dry_run=dry_run):
+                    log("ERROR", f"{label}: failed to deliver seat notification to Discord")
             notified = True
         elif seats != old_seats:
             log("INFO", f"{label}: seats {old_seats} → {seats}")
 
         # Waitlist notification (if enabled): 0 → >0
         if cfg.get("notify_waitlist") and wait_cap > 0:
-            if old_wait == 0 and wait > 0:
+            if old_wait <= 0 and wait > 0:
                 log("INFO", f"{label}: waitlist {old_wait} → {wait} (NOTIFY)")
                 embed = build_discord_embed(section, "waitlist", old_wait, wait)
                 if webhook_url:
-                    send_discord(webhook_url, embed, dry_run=dry_run)
+                    if not send_discord(webhook_url, embed, dry_run=dry_run):
+                        log("ERROR", f"{label}: failed to deliver waitlist notification to Discord")
                 notified = True
             elif wait != old_wait:
                 log("INFO", f"{label}: waitlist {old_wait} → {wait}")
+
+    # Detect sections that disappeared (cancelled or removed)
+    if not first_run:
+        for crn in state:
+            if crn not in new_state:
+                log("WARN", f"CRN {crn} disappeared from results — section may have been cancelled. "
+                            "Carrying forward last state to avoid false trigger on reappearance.")
+                new_state[crn] = state[crn]
 
     return new_state, notified
 
@@ -376,6 +425,15 @@ def main():
         log("FATAL", "DISCORD_WEBHOOK environment variable not set. Use --dry-run to test without it.")
         sys.exit(1)
 
+    # Acquire lockfile to prevent concurrent instances
+    lock_path = state_file + ".lock"
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("FATAL", f"Another instance is running (lockfile {lock_path}). Exiting.")
+        sys.exit(1)
+
     # Startup validation
     startup_checks(cfg)
 
@@ -390,21 +448,24 @@ def main():
             consecutive_failures = 0
         except requests.RequestException as e:
             consecutive_failures += 1
-            backoff = min(900, 30 * (2 ** (consecutive_failures - 1)))  # 30s, 60s, 120s, ... cap 900s
-            log("ERROR", f"HTTP error (attempt {consecutive_failures}): {e}. Backoff {backoff}s.")
+            backoff = min(900, 30 * (2 ** (consecutive_failures - 1)))
+            backoff += random.uniform(0, backoff * 0.25)  # jitter up to 25%
+            log("ERROR", f"HTTP error (attempt {consecutive_failures}): {e}. Backoff {backoff:.0f}s.")
             time.sleep(backoff)
             continue
         except json.JSONDecodeError as e:
             consecutive_failures += 1
             backoff = min(900, 30 * (2 ** (consecutive_failures - 1)))
-            log("ERROR", f"JSON decode error (attempt {consecutive_failures}): {e}. Backoff {backoff}s.")
+            backoff += random.uniform(0, backoff * 0.25)
+            log("ERROR", f"JSON decode error (attempt {consecutive_failures}): {e}. Backoff {backoff:.0f}s.")
             time.sleep(backoff)
             continue
         except RuntimeError as e:
             # Banner returned success=false or data=null — skip cycle, don't update state
             consecutive_failures += 1
             backoff = min(900, 30 * (2 ** (consecutive_failures - 1)))
-            log("ERROR", f"Banner error (attempt {consecutive_failures}): {e}. Backoff {backoff}s.")
+            backoff += random.uniform(0, backoff * 0.25)
+            log("ERROR", f"Banner error (attempt {consecutive_failures}): {e}. Backoff {backoff:.0f}s.")
             time.sleep(backoff)
             continue
 
