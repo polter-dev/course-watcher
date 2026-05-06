@@ -21,4 +21,4 @@ env/
 .DS_Store
 .vscode/
 .idea/
-*.swp.env
+*.swp
